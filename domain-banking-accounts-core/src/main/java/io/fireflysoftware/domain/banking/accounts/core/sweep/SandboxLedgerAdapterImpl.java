@@ -26,9 +26,9 @@ import java.nio.charset.StandardCharsets;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
-@Component
+@Component("sandboxLedgerAdapter")
 @ConditionalOnProperty(name = "firefly.accounts.ledger.adapter", havingValue = "sandbox", matchIfMissing = true)
-public class SandboxLedgerAdapter implements LedgerPort {
+public class SandboxLedgerAdapterImpl implements LedgerPort {
 
     private final ConcurrentHashMap<UUID, String> posted = new ConcurrentHashMap<>();
 

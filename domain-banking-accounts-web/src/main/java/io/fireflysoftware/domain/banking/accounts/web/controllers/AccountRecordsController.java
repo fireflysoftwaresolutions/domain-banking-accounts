@@ -19,7 +19,7 @@ package io.fireflysoftware.domain.banking.accounts.web.controllers;
 import io.fireflysoftware.core.banking.accounts.sdk.model.AccountStatementDTO;
 import io.fireflysoftware.core.banking.accounts.sdk.model.ServicingMandateDTO;
 import io.fireflysoftware.domain.banking.accounts.core.records.AccountRecordRequests;
-import io.fireflysoftware.domain.banking.accounts.core.records.AccountRecordService;
+import io.fireflysoftware.domain.banking.accounts.core.records.AccountRecordServiceImpl;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -34,9 +34,9 @@ import java.util.UUID;
 @RequestMapping("/api/v1/account-records")
 public class AccountRecordsController {
 
-    private final AccountRecordService records;
+    private final AccountRecordServiceImpl records;
 
-    public AccountRecordsController(AccountRecordService records) {
+    public AccountRecordsController(AccountRecordServiceImpl records) {
         this.records = records;
     }
 

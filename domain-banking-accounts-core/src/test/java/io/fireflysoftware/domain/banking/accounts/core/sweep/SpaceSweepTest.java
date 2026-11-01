@@ -58,9 +58,9 @@ class SpaceSweepTest {
                 .thenReturn(Mono.just(new SpaceTransactionDTO()));
         when(transactions.recordTransaction(eq(targetId), eq(new BigDecimal("25.00")), any(), any(), any()))
                 .thenReturn(Mono.just(new SpaceTransactionDTO()));
-        SandboxLedgerAdapter ledger = new SandboxLedgerAdapter();
+        SandboxLedgerAdapterImpl ledger = new SandboxLedgerAdapterImpl();
 
-        UUID posting = new SweepSpacesService(spaces, transactions, ledger)
+        UUID posting = new SweepSpacesServiceImpl(spaces, transactions, ledger)
                 .sweep(accountId, sourceId, targetId, new BigDecimal("25.00"), "USD").block();
 
         assertThat(posting).isNotNull();

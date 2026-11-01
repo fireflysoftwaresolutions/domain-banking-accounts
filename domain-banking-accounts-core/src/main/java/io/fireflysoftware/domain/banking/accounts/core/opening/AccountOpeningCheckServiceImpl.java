@@ -30,12 +30,12 @@ import reactor.core.publisher.Mono;
 
 import java.util.UUID;
 
-@Service
-public class AccountOpeningCheckService {
+@Service("accountOpeningCheckService")
+public class AccountOpeningCheckServiceImpl {
 
     private final SagaEngine engine;
 
-    public AccountOpeningCheckService(SagaEngine engine) {
+    public AccountOpeningCheckServiceImpl(SagaEngine engine) {
         this.engine = engine;
     }
 
