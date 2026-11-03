@@ -32,13 +32,13 @@ import java.util.UUID;
  * Statement close, withdrawal limit, space sweep, and servicing mandate.
  * The accounts core already stores these rows. This service calls that core SDK.
  */
-@Service
-public class AccountRecordService {
+@Service("accountRecordService")
+public class AccountRecordServiceImpl {
 
     private final DepositProductApi products;
     private final ServicingMandateApi mandates;
 
-    public AccountRecordService(DepositProductApi products, ServicingMandateApi mandates) {
+    public AccountRecordServiceImpl(DepositProductApi products, ServicingMandateApi mandates) {
         this.products = products;
         this.mandates = mandates;
     }

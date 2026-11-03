@@ -182,6 +182,12 @@ All endpoints return reactive `Mono<ResponseEntity>` or `Flux<ResponseEntity>` r
 | `POST` | `/api/v1/accounts` | Open a new account (saga-orchestrated) |
 | `POST` | `/api/v1/accounts/{accountId}/close` | Close an account |
 
+### Account closure settlement limits
+
+The legacy closure saga requires a known ledger residual. An empty observation or missing amount fails instead of becoming zero. `forceClose` permits settlement of a positive customer balance; it never waives debt. The remaining amount must have a destination different from the closing account, and closure fees cannot be negative or exceed the available residual. For example, a balance of 100.00 with fees of 15.00 produces a fee transaction for 15.00 followed by a refund transaction for 85.00. Each transaction must return a nonzero identity before the saga records its receipt or reports settlement.
+
+These checks cover settlement decisions only. The current legacy close route is **not a qualified complete account-closure journey**: a paginated leg read is not an atomic financial snapshot, and final closure still needs Core-owned obligation checks, concurrent-operation fences, durable recovery, and coordinated contract/card/payment handling. Do not interpret a successful unit test or a generic account status update as proof that an account can safely close.
+
 ### Account Backoffice (`/api/v1/backoffice/accounts`)
 
 | Method | Path | Summary |

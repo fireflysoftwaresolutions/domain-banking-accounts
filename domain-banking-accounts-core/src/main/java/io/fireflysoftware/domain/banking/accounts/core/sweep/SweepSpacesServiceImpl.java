@@ -28,14 +28,14 @@ import java.util.UUID;
 /**
  * Sweeps one space into another through the accounts core SDK, then posts a balanced ledger pair.
  */
-@Service
-public class SweepSpacesService {
+@Service("sweepSpacesService")
+public class SweepSpacesServiceImpl {
 
     private final AccountSpacesApi spaces;
     private final AccountSpaceTransactionsApi transactions;
     private final LedgerPort ledger;
 
-    public SweepSpacesService(AccountSpacesApi spaces, AccountSpaceTransactionsApi transactions, LedgerPort ledger) {
+    public SweepSpacesServiceImpl(AccountSpacesApi spaces, AccountSpaceTransactionsApi transactions, LedgerPort ledger) {
         this.spaces = spaces;
         this.transactions = transactions;
         this.ledger = ledger;

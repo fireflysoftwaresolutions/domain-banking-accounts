@@ -20,7 +20,7 @@ package io.fireflysoftware.domain.banking.accounts.web.controllers;
 import io.fireflysoftware.domain.banking.accounts.core.account.commands.CloseAccountCommand;
 import io.fireflysoftware.domain.banking.accounts.core.account.commands.OpenAccountCommand;
 import io.fireflysoftware.domain.banking.accounts.core.account.services.AccountService;
-import io.fireflysoftware.domain.banking.accounts.core.opening.AccountOpeningCheckService;
+import io.fireflysoftware.domain.banking.accounts.core.opening.AccountOpeningCheckServiceImpl;
 import io.fireflysoftware.domain.banking.accounts.core.opening.DocumentVerificationDecision;
 import io.fireflysoftware.domain.banking.accounts.core.opening.EligibilityDecision;
 import io.fireflysoftware.domain.banking.accounts.interfaces.dtos.OpenAccountResponse;
@@ -41,7 +41,7 @@ import java.util.UUID;
 public class AccountsController {
 
     private final AccountService accountService;
-    private final AccountOpeningCheckService accountOpeningCheckService;
+    private final AccountOpeningCheckServiceImpl accountOpeningCheckService;
 
     @PostMapping
     @Operation(summary = "Open a new account", description = "Opens a new bank account with contract, party, balance, and space setup")

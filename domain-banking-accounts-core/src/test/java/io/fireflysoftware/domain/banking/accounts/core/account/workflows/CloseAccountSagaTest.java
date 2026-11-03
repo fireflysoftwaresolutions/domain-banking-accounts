@@ -121,7 +121,8 @@ class CloseAccountSagaTest {
         UUID accountId = UUID.randomUUID();
         BigDecimal residual = new BigDecimal("50.00");
         CloseAccountCommand cmd = CloseAccountCommand.builder()
-                .accountId(accountId).reason("force").currency("EUR").forceClose(true).build();
+                .accountId(accountId).reason("force").currency("EUR").forceClose(true)
+                .destinationAccountId(UUID.randomUUID()).build();
 
         when(queryBus.<AccountResidualBalanceResult>query(any(GetAccountResidualBalanceQuery.class)))
                 .thenReturn(Mono.just(AccountResidualBalanceResult.builder().residual(residual).build()));
@@ -131,6 +132,159 @@ class CloseAccountSagaTest {
                 .verifyComplete();
 
         verify(ctx).putVariable(CTX_RESIDUAL_AMOUNT, residual);
+    }
+
+    @Test
+    void validateZeroBalance_missingResidualMustNotMeanZero() {
+        var cmd = CloseAccountCommand.builder().accountId(UUID.randomUUID()).currency("EUR").build();
+        when(queryBus.<AccountResidualBalanceResult>query(any(GetAccountResidualBalanceQuery.class)))
+                .thenReturn(Mono.just(AccountResidualBalanceResult.builder().build()));
+        StepVerifier.create(saga.validateZeroBalance(cmd, ctx))
+                .expectError(IllegalStateException.class).verify();
+        verify(ctx, never()).putVariable(CTX_RESIDUAL_AMOUNT, BigDecimal.ZERO);
+    }
+
+    @Test
+    void validateZeroBalance_emptyOwnerResponseMustFail() {
+        var cmd = CloseAccountCommand.builder().accountId(UUID.randomUUID()).currency("EUR").build();
+        when(queryBus.<AccountResidualBalanceResult>query(any(GetAccountResidualBalanceQuery.class)))
+                .thenReturn(Mono.empty());
+        StepVerifier.create(saga.validateZeroBalance(cmd, ctx))
+                .expectError(IllegalStateException.class).verify();
+    }
+
+    @Test
+    void validateZeroBalance_forceMustNotEraseAnOverdraft() {
+        var cmd = CloseAccountCommand.builder().accountId(UUID.randomUUID()).currency("EUR")
+                .forceClose(true).destinationAccountId(UUID.randomUUID()).build();
+        when(queryBus.<AccountResidualBalanceResult>query(any(GetAccountResidualBalanceQuery.class)))
+                .thenReturn(Mono.just(AccountResidualBalanceResult.builder().residual(new BigDecimal("-25.00")).build()));
+        StepVerifier.create(saga.validateZeroBalance(cmd, ctx))
+                .expectError(AccountNotEmptyException.class).verify();
+    }
+
+    @Test
+    void validateZeroBalance_positiveResidualRequiresDestination() {
+        var cmd = CloseAccountCommand.builder().accountId(UUID.randomUUID()).currency("EUR").forceClose(true).build();
+        when(queryBus.<AccountResidualBalanceResult>query(any(GetAccountResidualBalanceQuery.class)))
+                .thenReturn(Mono.just(AccountResidualBalanceResult.builder().residual(new BigDecimal("50.00")).build()));
+        StepVerifier.create(saga.validateZeroBalance(cmd, ctx))
+                .expectError(IllegalArgumentException.class).verify();
+    }
+
+    @Test
+    void settleOutstanding_missingResidualMustNotSkipSettlement() {
+        settlementContext(null, null, null);
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalStateException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_missingDestinationMustNotAbandonCustomerMoney() {
+        settlementContext(new BigDecimal("100.00"), null, null);
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalArgumentException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_negativeResidualMustNotSkipDebt() {
+        settlementContext(new BigDecimal("-1.00"), null, null);
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(AccountNotEmptyException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_feesMustNotCreateAnOverdraft() {
+        settlementContext(new BigDecimal("10.00"), new BigDecimal("12.00"), null);
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(AccountNotEmptyException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_negativeFeesMustNotIncreaseRefund() {
+        settlementContext(new BigDecimal("100.00"), new BigDecimal("-10.00"), UUID.randomUUID());
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalArgumentException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_sourceMustNotBeItsOwnDestination() {
+        UUID source = settlementContext(new BigDecimal("100.00"), null, null);
+        when(ctx.getVariableAs(CTX_DESTINATION_ACCOUNT_ID, UUID.class)).thenReturn(source);
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalArgumentException.class).verify();
+        verify(commandBus, never()).send(any(PostLedgerTransactionCommand.class));
+    }
+
+    @Test
+    void settleOutstanding_emptyFeeReceiptMustNotMeanSettled() {
+        settlementContext(new BigDecimal("15.00"), new BigDecimal("15.00"), null);
+        when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))
+                .thenReturn(Mono.empty());
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalStateException.class).verify();
+    }
+
+    @Test
+    void settleOutstanding_emptyTransferReceiptMustNotMeanSettled() {
+        settlementContext(new BigDecimal("100.00"), null, UUID.randomUUID());
+        when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))
+                .thenReturn(Mono.empty());
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalStateException.class).verify();
+    }
+
+    @Test
+    void settleOutstanding_zeroTransactionIdentityMustNotMeanSettled() {
+        settlementContext(new BigDecimal("100.00"), null, UUID.randomUUID());
+        when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))
+                .thenReturn(Mono.just(PostLedgerTransactionResult.builder().transactionId(new UUID(0, 0)).build()));
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectError(IllegalStateException.class).verify();
+    }
+
+    @Test
+    void settleOutstanding_feeAndRefundUseExactRemainingAmountInOrder() {
+        UUID destination = UUID.randomUUID();
+        UUID account = settlementContext(new BigDecimal("100.00"), new BigDecimal("15.00"), destination);
+        UUID feeId = UUID.randomUUID();
+        UUID refundId = UUID.randomUUID();
+        var sent = new java.util.ArrayList<PostLedgerTransactionCommand>();
+        when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))
+                .thenAnswer(invocation -> {
+                    PostLedgerTransactionCommand command = invocation.getArgument(0);
+                    sent.add(command);
+                    return Mono.just(PostLedgerTransactionResult.builder()
+                            .transactionId(sent.size() == 1 ? feeId : refundId).build());
+                });
+        StepVerifier.create(saga.settleOutstanding(SAGA_ID, ctx))
+                .expectNext(RESULT_SETTLED).verifyComplete();
+        assertThat(sent).hasSize(2);
+        assertThat(sent.get(0).getTransactionType()).isEqualTo("FEE");
+        assertThat(sent.get(0).getTotalAmount()).isEqualByComparingTo("15.00");
+        assertThat(sent.get(1).getTransactionType()).isEqualTo("TRANSFER");
+        assertThat(sent.get(1).getTotalAmount()).isEqualByComparingTo("85.00");
+        assertThat(sent.get(1).getLegs().get(0).getAccountId()).isEqualTo(account);
+        assertThat(sent.get(1).getLegs().get(1).getAccountId()).isEqualTo(destination);
+        verify(ctx).putVariable(CTX_SETTLE_FEE_TX_ID, feeId);
+        verify(ctx).putVariable(CTX_SETTLE_RESIDUAL_TX_ID, refundId);
+    }
+
+    private UUID settlementContext(BigDecimal residual, BigDecimal fees, UUID destination) {
+        UUID account = UUID.randomUUID();
+        org.mockito.Mockito.lenient().when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))
+                .thenReturn(Mono.error(new AssertionError("Invalid settlement must not post a ledger transaction")));
+        when(ctx.getVariableAs(CTX_ACCOUNT_ID, UUID.class)).thenReturn(account);
+        when(ctx.getVariableAs(CTX_ACCOUNT_CURRENCY, String.class)).thenReturn("EUR");
+        when(ctx.getVariableAs(CTX_RESIDUAL_AMOUNT, BigDecimal.class)).thenReturn(residual);
+        when(ctx.getVariableAs(CTX_FEES_OWED, BigDecimal.class)).thenReturn(fees);
+        when(ctx.getVariableAs(CTX_DESTINATION_ACCOUNT_ID, UUID.class)).thenReturn(destination);
+        return account;
     }
 
     @Test
@@ -158,7 +312,7 @@ class CloseAccountSagaTest {
 
         when(ctx.getVariableAs(CTX_ACCOUNT_ID, UUID.class)).thenReturn(accountId);
         when(ctx.getVariableAs(CTX_ACCOUNT_CURRENCY, String.class)).thenReturn("EUR");
-        when(ctx.getVariableAs(CTX_RESIDUAL_AMOUNT, BigDecimal.class)).thenReturn(BigDecimal.ZERO);
+        when(ctx.getVariableAs(CTX_RESIDUAL_AMOUNT, BigDecimal.class)).thenReturn(fees);
         when(ctx.getVariableAs(CTX_FEES_OWED, BigDecimal.class)).thenReturn(fees);
         when(ctx.getVariableAs(CTX_DESTINATION_ACCOUNT_ID, UUID.class)).thenReturn(null);
         when(commandBus.<PostLedgerTransactionResult>send(any(PostLedgerTransactionCommand.class)))

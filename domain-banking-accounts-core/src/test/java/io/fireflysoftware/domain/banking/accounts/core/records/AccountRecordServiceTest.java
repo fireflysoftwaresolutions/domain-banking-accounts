@@ -48,7 +48,7 @@ class AccountRecordServiceTest {
 
     @Test
     void statementLimitSweepAndMandateGoThroughTheAccountsCoreSdk() {
-        AccountRecordService service = new AccountRecordService(products, mandates);
+        AccountRecordServiceImpl service = new AccountRecordServiceImpl(products, mandates);
         UUID accountId = UUID.randomUUID();
         UUID statementId = UUID.randomUUID();
         UUID limitId = UUID.randomUUID();

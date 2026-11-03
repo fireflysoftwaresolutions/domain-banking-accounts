@@ -95,20 +95,12 @@ import static io.fireflysoftware.domain.banking.accounts.core.account.utils.Clos
 import static io.fireflysoftware.domain.banking.accounts.core.account.utils.CloseAccountConstants.STEP_VALIDATE_BALANCE;
 
 /**
- * Saga orchestrator for closing a bank account.
+ * Orchestrates account closure settlement. A positive residual needs a different
+ * destination account; fees must not create debt. Missing ledger observations or
+ * settlement receipts are failures, and forceClose never waives an overdraft.
  *
- * <p>Balance validation is ledger-driven: we ask core-banking-ledger for the signed residual
- * ({@code Σ CREDIT − Σ DEBIT}) across every leg on the account, ignoring the
- * {@code account_balance} projection. Closure decisions happen on that number:
- * <ul>
- *   <li>If residual is zero → proceed to settlement (which may be a no-op).</li>
- *   <li>If residual is non-zero AND {@code forceClose=false} → fail with
- *       {@link AccountNotEmptyException} so the caller can re-issue with
- *       {@code destinationAccountId}.</li>
- *   <li>If residual is non-zero AND {@code forceClose=true} → proceed to settlement, which
- *       posts a fee leg (if {@code feesOwed > 0}) and a residual transfer leg (if a
- *       destination is supplied and the after-fees residual is positive).</li>
- * </ul>
+ * <p>This legacy saga does not provide a concurrent-operation fence or a complete
+ * obligation inventory. Its settlement checks do not authorize final account closure.
  */
 @Slf4j
 @Saga(name = SAGA_CLOSE_ACCOUNT_NAME)
@@ -145,55 +137,74 @@ public class CloseAccountSaga {
     @SagaStep(id = STEP_VALIDATE_BALANCE)
     @StepEvent(type = EVENT_BALANCE_VALIDATED)
     public Mono<Object> validateZeroBalance(CloseAccountCommand cmd, ExecutionContext ctx) {
-        // NOTE: ExecutionContext.variables is a ConcurrentHashMap — it rejects null values
-        // with an unhelpful NPE (error=null in orchestration logs). Guard every put.
-        if (cmd.getAccountId() != null) ctx.putVariable(CTX_ACCOUNT_ID, cmd.getAccountId());
-        if (cmd.getCurrency() != null) ctx.putVariable(CTX_ACCOUNT_CURRENCY, cmd.getCurrency());
-        ctx.putVariable(CTX_FORCE_CLOSE, Boolean.TRUE.equals(cmd.getForceClose()));
-        if (cmd.getDestinationAccountId() != null) ctx.putVariable(CTX_DESTINATION_ACCOUNT_ID, cmd.getDestinationAccountId());
-        if (cmd.getFeesOwed() != null) ctx.putVariable(CTX_FEES_OWED, cmd.getFeesOwed());
-
-        return queryBus.<AccountResidualBalanceResult>query(GetAccountResidualBalanceQuery.builder()
-                        .accountId(cmd.getAccountId())
-                        .build())
-                .flatMap(result -> {
-                    BigDecimal residual = result == null || result.getResidual() == null
-                            ? BigDecimal.ZERO : result.getResidual();
-                    ctx.putVariable(CTX_RESIDUAL_AMOUNT, residual);
-                    if (residual.signum() == 0 || Boolean.TRUE.equals(cmd.getForceClose())) {
+        return Mono.defer(() -> {
+            if (cmd == null || cmd.getAccountId() == null || cmd.getCurrency() == null
+                    || !cmd.getCurrency().matches("[A-Z]{3}")) {
+                return Mono.error(new IllegalArgumentException("Account and currency are required for closure"));
+            }
+            return queryBus.<AccountResidualBalanceResult>query(GetAccountResidualBalanceQuery.builder()
+                            .accountId(cmd.getAccountId()).build())
+                    .switchIfEmpty(Mono.error(new IllegalStateException("Account residual is unavailable")))
+                    .flatMap(result -> {
+                        BigDecimal residual = result.getResidual();
+                        if (residual == null) return Mono.error(new IllegalStateException("Account residual is unavailable"));
+                        if (residual.signum() != 0 && !Boolean.TRUE.equals(cmd.getForceClose())) {
+                            return Mono.error(new AccountNotEmptyException(cmd.getAccountId(), residual));
+                        }
+                        validateSettlement(cmd.getAccountId(), residual, cmd.getFeesOwed(), cmd.getDestinationAccountId());
+                        ctx.putVariable(CTX_ACCOUNT_ID, cmd.getAccountId());
+                        ctx.putVariable(CTX_ACCOUNT_CURRENCY, cmd.getCurrency());
+                        ctx.putVariable(CTX_FORCE_CLOSE, Boolean.TRUE.equals(cmd.getForceClose()));
+                        if (cmd.getDestinationAccountId() != null) ctx.putVariable(CTX_DESTINATION_ACCOUNT_ID, cmd.getDestinationAccountId());
+                        if (cmd.getFeesOwed() != null) ctx.putVariable(CTX_FEES_OWED, cmd.getFeesOwed());
+                        ctx.putVariable(CTX_RESIDUAL_AMOUNT, residual);
                         return Mono.<Object>just(RESULT_BALANCE_VALIDATED);
-                    }
-                    return Mono.error(new AccountNotEmptyException(cmd.getAccountId(), residual));
-                });
+                    });
+        });
     }
 
     @SagaStep(id = STEP_SETTLE, compensate = COMPENSATE_REVERSE_SETTLEMENT, dependsOn = STEP_VALIDATE_BALANCE)
     @StepEvent(type = EVENT_SETTLED)
     public Mono<Object> settleOutstanding(@CorrelationId String sagaId, ExecutionContext ctx) {
-        UUID accountId = ctx.getVariableAs(CTX_ACCOUNT_ID, UUID.class);
-        String currency = ctx.getVariableAs(CTX_ACCOUNT_CURRENCY, String.class);
-        BigDecimal residual = ctx.getVariableAs(CTX_RESIDUAL_AMOUNT, BigDecimal.class);
-        BigDecimal feesOwed = ctx.getVariableAs(CTX_FEES_OWED, BigDecimal.class);
-        UUID destinationAccountId = ctx.getVariableAs(CTX_DESTINATION_ACCOUNT_ID, UUID.class);
+        return Mono.defer(() -> {
+            UUID accountId = ctx.getVariableAs(CTX_ACCOUNT_ID, UUID.class);
+            String currency = ctx.getVariableAs(CTX_ACCOUNT_CURRENCY, String.class);
+            BigDecimal residual = ctx.getVariableAs(CTX_RESIDUAL_AMOUNT, BigDecimal.class);
+            BigDecimal feesOwed = ctx.getVariableAs(CTX_FEES_OWED, BigDecimal.class);
+            UUID destinationAccountId = ctx.getVariableAs(CTX_DESTINATION_ACCOUNT_ID, UUID.class);
+            BigDecimal afterFees = validateSettlement(accountId, residual, feesOwed, destinationAccountId);
+            if (currency == null || !currency.matches("[A-Z]{3}")) {
+                return Mono.error(new IllegalArgumentException("Settlement currency is required"));
+            }
+            boolean hasFees = feesOwed != null && feesOwed.signum() > 0;
+            if (!hasFees && afterFees.signum() == 0) {
+                return Mono.just(RESULT_SKIPPED);
+            }
+            Mono<Void> feeTx = hasFees
+                    ? Mono.defer(() -> postFeeSettlement(sagaId, accountId, feesOwed, currency, ctx)).then()
+                    : Mono.empty();
+            Mono<Void> residualTx = afterFees.signum() > 0
+                    ? Mono.defer(() -> postResidualTransfer(sagaId, accountId, destinationAccountId, afterFees, currency, ctx)).then()
+                    : Mono.empty();
+            return feeTx.then(residualTx).thenReturn(RESULT_SETTLED);
+        });
+    }
 
-        boolean hasFees = feesOwed != null && feesOwed.signum() > 0;
-        BigDecimal residualSafe = residual == null ? BigDecimal.ZERO : residual;
-        BigDecimal afterFees = hasFees ? residualSafe.subtract(feesOwed) : residualSafe;
-        boolean hasResidualToMove = afterFees.signum() > 0 && destinationAccountId != null;
-
-        if (!hasFees && !hasResidualToMove) {
-            log.info("Skipping settlement — no fees and no residual to move sagaId={}", sagaId);
-            return Mono.just(RESULT_SKIPPED);
+    private BigDecimal validateSettlement(UUID accountId, BigDecimal residual, BigDecimal fees, UUID destination) {
+        if (accountId == null) throw new IllegalArgumentException("Closure account is required");
+        if (residual == null) throw new IllegalStateException("Account residual is unavailable");
+        if (fees != null && fees.signum() < 0) throw new IllegalArgumentException("Closure fees cannot be negative");
+        BigDecimal afterFees = residual.subtract(fees == null ? BigDecimal.ZERO : fees);
+        if (residual.signum() < 0 || afterFees.signum() < 0) {
+            throw new AccountNotEmptyException(accountId, afterFees);
         }
-
-        Mono<Void> feeTx = hasFees
-                ? postFeeSettlement(sagaId, accountId, feesOwed, currency, ctx).then()
-                : Mono.empty();
-        Mono<Void> residualTx = hasResidualToMove
-                ? postResidualTransfer(sagaId, accountId, destinationAccountId, afterFees, currency, ctx).then()
-                : Mono.empty();
-
-        return feeTx.then(residualTx).thenReturn(RESULT_SETTLED);
+        if (destination != null && destination.equals(accountId)) {
+            throw new IllegalArgumentException("Closure destination must differ from the source account");
+        }
+        if (afterFees.signum() > 0 && destination == null) {
+            throw new IllegalArgumentException("A destination is required for the remaining customer balance");
+        }
+        return afterFees;
     }
 
     private Mono<PostLedgerTransactionResult> postFeeSettlement(String sagaId, UUID accountId,
@@ -227,8 +238,7 @@ public class CloseAccountSaga {
                 .initialStatus(STATUS_POSTED)
                 .build();
 
-        return commandBus.<PostLedgerTransactionResult>send(feeCmd)
-                .doOnNext(result -> ctx.putVariable(CTX_SETTLE_FEE_TX_ID, result.getTransactionId()));
+        return recordSettlement(commandBus.send(feeCmd), ctx, CTX_SETTLE_FEE_TX_ID);
     }
 
     private Mono<PostLedgerTransactionResult> postResidualTransfer(String sagaId, UUID accountId,
@@ -258,8 +268,15 @@ public class CloseAccountSaga {
                 .initialStatus(STATUS_POSTED)
                 .build();
 
-        return commandBus.<PostLedgerTransactionResult>send(transferCmd)
-                .doOnNext(result -> ctx.putVariable(CTX_SETTLE_RESIDUAL_TX_ID, result.getTransactionId()));
+        return recordSettlement(commandBus.send(transferCmd), ctx, CTX_SETTLE_RESIDUAL_TX_ID);
+    }
+
+    private Mono<PostLedgerTransactionResult> recordSettlement(Mono<PostLedgerTransactionResult> result,
+                                                               ExecutionContext ctx, String key) {
+        return result.filter(receipt -> receipt.getTransactionId() != null
+                        && !receipt.getTransactionId().equals(new UUID(0, 0)))
+                .switchIfEmpty(Mono.error(new IllegalStateException("Ledger settlement receipt is unavailable")))
+                .doOnNext(receipt -> ctx.putVariable(key, receipt.getTransactionId()));
     }
 
     public Mono<Void> reverseSettlement(Object ignored, @CorrelationId String sagaId, ExecutionContext ctx) {
